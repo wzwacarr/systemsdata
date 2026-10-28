@@ -16,8 +16,5 @@ select cron.schedule('sync-current-rms', '7 * * * *',  $$select hub.trigger_sync
 select cron.schedule('sync-brighthr',    '17 * * * *', $$select hub.trigger_sync('brighthr')$$);
 select cron.schedule('sync-wordpress',   '27 5 * * *', $$select hub.trigger_sync('wordpress')$$);
 
--- Keep logs small on the free tier.
-select cron.schedule('prune-sync-logs', '43 3 * * *', $$
-  delete from hub.sync_runs where started_at < now() - interval '30 days';
-  delete from net._http_response where created < now() - interval '2 days';
-$$);
+
+-- TODO: log pruning job (needs owner approval in Supabase before applying).
