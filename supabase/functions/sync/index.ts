@@ -28,8 +28,17 @@ function need(name: string): string {
   return v;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Retries 429 (rate limited) with backoff, and slows down when a source says its budget is nearly spent.
 async function getJson(url: string, init: RequestInit): Promise<any> {
-  const res = await fetch(url, init);
+  let res = await fetch(url, init);
+  for (let attempt = 0; res.status === 429 && attempt < 4; attempt++) {
+    await res.body?.cancel();
+    await sleep(2000 * 2 ** attempt);
+    res = await fetch(url, init);
+  }
+  if (Number(res.headers.get("X-Rate-Limit-Remaining") ?? 99) <= 1) await sleep(1000);
   if (!res.ok) throw new Error(`${init.method ?? "GET"} ${new URL(url).pathname} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
   return res.json();
 }
@@ -82,20 +91,28 @@ async function brightQuery(token: string, path: string, filters?: object): Promi
 
 const isoDate = (d: Date) => d.toISOString().slice(0, 10);
 
+let partial = false; // Set when a source ran out of time; the run is logged as 'partial'.
+
 async function syncBrightHr(): Promise<Row[]> {
   const token = await brightToken();
   const rows: Row[] = [];
   const employees = await brightQuery(token, "/employees/v1/query");
   const now = new Date();
   const day = 86_400_000;
+  // Edge Functions stop after about 150 seconds; leave room to save what we have.
+  const deadline = Date.now() + 110_000;
   for (const e of employees) {
     rows.push({ entity: "employees", id: e.id, data: scrub(e) });
     if (e._metadata?.isTerminated) continue;
-    // Absences: last 30 days to next 60 days (API allows max 90 days back).
-    const absences = await brightQuery(token, "/absences/v1/query", {
-      employeeId: e.id, from: isoDate(new Date(now.getTime() - 30 * day)), to: isoDate(new Date(now.getTime() + 60 * day)),
-    });
-    absences.forEach((a, i) => rows.push({ entity: "absences", id: String(a.id ?? `${e.id}:${i}`), data: scrub({ ...a, employeeId: e.id }) }));
+    if (Date.now() > deadline) { partial = true; continue; }
+    // Absences: last 7 days to next 53 days, in 30-day windows (API allows max 31 days per call).
+    for (const offset of [-7, 23]) {
+      const from = new Date(now.getTime() + offset * day);
+      const absences = await brightQuery(token, "/absences/v1/query", {
+        employeeId: e.id, from: isoDate(from), to: isoDate(new Date(from.getTime() + 30 * day)),
+      });
+      absences.forEach((a, i) => rows.push({ entity: "absences", id: String(a.id ?? `${e.id}:${isoDate(from)}:${i}`), data: scrub({ ...a, employeeId: e.id }) }));
+    }
     // Clock-ins: last 7 days (API allows max 31-day range).
     const clockings = await brightQuery(token, "/blip/v1/clockings/query", {
       employeeId: e.id, from: new Date(now.getTime() - 7 * day).toISOString(), to: now.toISOString(),
@@ -131,8 +148,10 @@ const SOURCES: Record<string, () => Promise<Row[]>> = {
 
 async function runSource(source: string) {
   const [{ id }] = await sql`insert into hub.sync_runs (source) values (${source}) returning id`;
+  partial = false;
   try {
-    const rows = await SOURCES[source]();
+    // Overlapping windows can return the same record twice; keep the last copy.
+    const rows = [...new Map((await SOURCES[source]()).map((r) => [`${r.entity}:${r.id}`, r])).values()];
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500).map((r) => ({ source, entity: r.entity, id: r.id, data: sql.json(r.data as any), synced_at: new Date() }));
       await sql`
@@ -141,8 +160,8 @@ async function runSource(source: string) {
     }
     const counts: Record<string, number> = {};
     rows.forEach((r) => (counts[r.entity] = (counts[r.entity] ?? 0) + 1));
-    await sql`update hub.sync_runs set status = 'ok', finished_at = now(), row_count = ${rows.length}, detail = ${sql.json(counts)} where id = ${id}`;
-    return { source, status: "ok", rows: rows.length, counts };
+    await sql`update hub.sync_runs set status = ${partial ? "partial" : "ok"}, finished_at = now(), row_count = ${rows.length}, detail = ${sql.json(counts)} where id = ${id}`;
+    return { source, status: partial ? "partial" : "ok", rows: rows.length, counts };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await sql`update hub.sync_runs set status = 'error', finished_at = now(), detail = ${sql.json({ error: message })} where id = ${id}`;
