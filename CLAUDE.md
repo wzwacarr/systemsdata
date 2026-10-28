@@ -4,7 +4,7 @@ One place for all company data. Claude and ChatGPT read from here, not from each
 
 ## Rules
 - Read-only against every source system. Never write back.
-- Keys live in GitHub Actions secrets for this repo. Never in code, never in chat.
+- Keys live in Supabase Edge Function secrets (project wacarr-data-hub). Never in code, never in chat.
 - W.A. Carr data only. Never mix with WayMaker or any other client.
 - HR data: names, absence dates, hours only. No pay, addresses, or medical notes.
 - British English. No em or en dashes.
@@ -20,7 +20,11 @@ One place for all company data. Claude and ChatGPT read from here, not from each
 | Hik-Connect | Phase 3 | TBC |
 
 ## Hub
-Supabase project: TBC (W.A. Carr owned organisation).
+- Supabase project `wacarr-data-hub` (ref whdgxzsuuyyvymnkdhli), org wzwacarr's Org, eu-west-1.
+- Data in private schema `hub`: `hub.records` (source, entity, id, data jsonb) and `hub.sync_runs` (log).
+- Edge Function `sync` (supabase/functions/sync) pulls each source. pg_cron calls it hourly via `hub.trigger_sync(source)`.
+- Shared secret between cron and the function: Vault secret `sync_secret`.
+- Check health: `select source, status, row_count, detail, started_at from hub.sync_runs order by id desc limit 10;`
 
 ## Plan
 See docs/data-hub-plan.md.
