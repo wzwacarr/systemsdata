@@ -164,10 +164,13 @@ function wooProduct(p: any) {
   };
 }
 
+let wooDays = 3;
+
 async function syncWooCommerce(): Promise<Row[]> {
   const site = need("WC_SITE_URL").replace(/\/$/, "");
   const headers = { Authorization: "Basic " + btoa(`${need("WC_CONSUMER_KEY")}:${need("WC_CONSUMER_SECRET")}`) };
-  const since = new Date(Date.now() - 400 * 86_400_000).toISOString();
+  // Full history was backfilled on 30 Oct 2026. Hourly runs only need recent changes; ?days= overrides for a re-backfill.
+  const since = new Date(Date.now() - wooDays * 86_400_000).toISOString();
   const rows: Row[] = [];
   const pull = async (entity: string, extra: string, shape: (x: any) => unknown) => {
     for (let page = 1; page <= 50; page++) {
@@ -215,7 +218,9 @@ Deno.serve(async (req) => {
   const [{ secret }] = await sql`select decrypted_secret as secret from vault.decrypted_secrets where name = 'sync_secret'`;
   if (!secret || req.headers.get("x-sync-secret") !== secret) return new Response("forbidden", { status: 403 });
 
-  const requested = new URL(req.url).searchParams.get("source");
+  const params = new URL(req.url).searchParams;
+  wooDays = Math.min(Number(params.get("days")) || 3, 400);
+  const requested = params.get("source");
   const sources = requested ? [requested] : Object.keys(SOURCES);
   const unknown = sources.filter((s) => !SOURCES[s]);
   if (unknown.length) return new Response(`unknown source: ${unknown.join(", ")}`, { status: 400 });
