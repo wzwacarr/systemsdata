@@ -1,5 +1,5 @@
 // Read-only sync from W.A. Carr source systems into hub.records.
-// Called hourly by pg_cron with ?source=current_rms|brighthr|wordpress.
+// Called hourly by pg_cron with ?source=current_rms|brighthr|wordpress|woocommerce.
 // Source keys are Edge Function secrets, set in the Supabase dashboard.
 import postgres from "npm:postgres@3.4.5";
 
@@ -140,10 +140,50 @@ async function syncWordPress(): Promise<Row[]> {
   return rows;
 }
 
+// ---------- WooCommerce ----------
+// Read-only key (WooCommerce > Settings > Advanced > REST API, permission Read).
+// Orders keep money, dates, status and items only. Customer contact details are dropped.
+function wooOrder(o: any) {
+  return {
+    id: o.id, number: o.number, status: o.status, currency: o.currency,
+    date_created: o.date_created, date_modified: o.date_modified, date_paid: o.date_paid, date_completed: o.date_completed,
+    total: o.total, total_tax: o.total_tax, shipping_total: o.shipping_total, discount_total: o.discount_total,
+    payment_method_title: o.payment_method_title, created_via: o.created_via,
+    line_items: (o.line_items ?? []).map((li: any) => ({ product_id: li.product_id, name: li.name, sku: li.sku, quantity: li.quantity, total: li.total })),
+  };
+}
+
+function wooProduct(p: any) {
+  return {
+    id: p.id, name: p.name, sku: p.sku, status: p.status, type: p.type,
+    price: p.price, regular_price: p.regular_price, sale_price: p.sale_price,
+    stock_status: p.stock_status, stock_quantity: p.stock_quantity, total_sales: p.total_sales,
+    categories: (p.categories ?? []).map((c: any) => c.name), date_modified: p.date_modified,
+  };
+}
+
+async function syncWooCommerce(): Promise<Row[]> {
+  const site = need("WC_SITE_URL").replace(/\/$/, "");
+  const headers = { Authorization: "Basic " + btoa(`${need("WC_CONSUMER_KEY")}:${need("WC_CONSUMER_SECRET")}`) };
+  const since = new Date(Date.now() - 400 * 86_400_000).toISOString();
+  const rows: Row[] = [];
+  const pull = async (entity: string, extra: string, shape: (x: any) => unknown) => {
+    for (let page = 1; page <= 50; page++) {
+      const items: any[] = await getJson(`${site}/wp-json/wc/v3/${entity}?per_page=100&page=${page}${extra}`, { headers });
+      for (const item of items) rows.push({ entity, id: String(item.id), data: shape(item) });
+      if (items.length < 100) break;
+    }
+  };
+  await pull("orders", `&modified_after=${encodeURIComponent(since)}`, wooOrder);
+  await pull("products", "", wooProduct);
+  return rows;
+}
+
 const SOURCES: Record<string, () => Promise<Row[]>> = {
   current_rms: syncCurrentRms,
   brighthr: syncBrightHr,
   wordpress: syncWordPress,
+  woocommerce: syncWooCommerce,
 };
 
 async function runSource(source: string) {
