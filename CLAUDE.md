@@ -12,10 +12,11 @@ One place for all company data. Claude and ChatGPT read from here, not from each
 ## Sources
 | System | Route | Secret names |
 |---|---|---|
-| Current RMS | REST API, hourly | CURRENT_RMS_SUBDOMAIN, CURRENT_RMS_API_KEY |
+| Current RMS | Fallback only. Read via WA Staff database once live, to protect Current's API rate limit | CURRENT_RMS_SUBDOMAIN, CURRENT_RMS_API_KEY |
 | BrightHR | Customer API (login.brighthr.com, api.bright.hr), hourly | BRIGHTHR_API_KEY (may also need BRIGHTHR_CLIENT_ID) |
-| WordPress (wacarrandson.co.uk) | WP REST API, daily | WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD |
-| wastaff.com | Bespoke portal, no API. Awaiting developer | TBC |
+| WordPress (W.A. Carr & Son, Your Event, Lux Catering, one more) incl. WooCommerce | WP REST API, daily | WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD |
+| WA Staff (wastaff.com) | Source of truth. Connor's SQL database on a Plesk server. Read-only access requested 30 Oct | TBC |
+| Xero | Read-only user requested 30 Oct | TBC |
 | Microsoft 365 | Stays in Microsoft, read live via connectors. Counts only in hub | n/a |
 | Hik-Connect | Phase 3 | TBC |
 
@@ -26,5 +27,6 @@ One place for all company data. Claude and ChatGPT read from here, not from each
 - Shared secret between cron and the function: Vault secret `sync_secret`.
 - Check health: `select source, status, row_count, detail, started_at from hub.sync_runs order by id desc limit 10;`
 
-## Plan
-See docs/data-hub-plan.md.
+## Plan and context
+- docs/data-hub-plan.md: the hub plan.
+- docs/context-2026-10-30-connor-meeting.md: how the systems connect, who owns what. Read this first.
