@@ -31,12 +31,14 @@ function need(name: string): string {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Retries 429 (rate limited) with backoff, and slows down when a source says its budget is nearly spent.
+// Each request gives up after 20 seconds, so one silent source cannot hang the whole run.
 async function getJson(url: string, init: RequestInit): Promise<any> {
-  let res = await fetch(url, init);
+  const call = () => fetch(url, { ...init, signal: AbortSignal.timeout(20_000) });
+  let res = await call();
   for (let attempt = 0; res.status === 429 && attempt < 4; attempt++) {
     await res.body?.cancel();
     await sleep(2000 * 2 ** attempt);
-    res = await fetch(url, init);
+    res = await call();
   }
   if (Number(res.headers.get("X-Rate-Limit-Remaining") ?? 99) <= 1) await sleep(1000);
   if (!res.ok) throw new Error(`${init.method ?? "GET"} ${new URL(url).pathname} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
