@@ -1,5 +1,5 @@
 // Read-only sync from W.A. Carr source systems into hub.records.
-// Called hourly by pg_cron with ?source=current_rms|brighthr|wordpress.
+// Called hourly by pg_cron with ?source=current_rms|brighthr|wordpress|woocommerce.
 // Source keys are Edge Function secrets, set in the Supabase dashboard.
 import postgres from "npm:postgres@3.4.5";
 
@@ -31,12 +31,14 @@ function need(name: string): string {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Retries 429 (rate limited) with backoff, and slows down when a source says its budget is nearly spent.
+// Each request gives up after 20 seconds, so one silent source cannot hang the whole run.
 async function getJson(url: string, init: RequestInit): Promise<any> {
-  let res = await fetch(url, init);
+  const call = () => fetch(url, { ...init, signal: AbortSignal.timeout(20_000) });
+  let res = await call();
   for (let attempt = 0; res.status === 429 && attempt < 4; attempt++) {
     await res.body?.cancel();
     await sleep(2000 * 2 ** attempt);
-    res = await fetch(url, init);
+    res = await call();
   }
   if (Number(res.headers.get("X-Rate-Limit-Remaining") ?? 99) <= 1) await sleep(1000);
   if (!res.ok) throw new Error(`${init.method ?? "GET"} ${new URL(url).pathname} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
@@ -140,10 +142,53 @@ async function syncWordPress(): Promise<Row[]> {
   return rows;
 }
 
+// ---------- WooCommerce ----------
+// Read-only key (WooCommerce > Settings > Advanced > REST API, permission Read).
+// Orders keep money, dates, status and items only. Customer contact details are dropped.
+function wooOrder(o: any) {
+  return {
+    id: o.id, number: o.number, status: o.status, currency: o.currency,
+    date_created: o.date_created, date_modified: o.date_modified, date_paid: o.date_paid, date_completed: o.date_completed,
+    total: o.total, total_tax: o.total_tax, shipping_total: o.shipping_total, discount_total: o.discount_total,
+    payment_method_title: o.payment_method_title, created_via: o.created_via,
+    line_items: (o.line_items ?? []).map((li: any) => ({ product_id: li.product_id, name: li.name, sku: li.sku, quantity: li.quantity, total: li.total })),
+  };
+}
+
+function wooProduct(p: any) {
+  return {
+    id: p.id, name: p.name, sku: p.sku, status: p.status, type: p.type,
+    price: p.price, regular_price: p.regular_price, sale_price: p.sale_price,
+    stock_status: p.stock_status, stock_quantity: p.stock_quantity, total_sales: p.total_sales,
+    categories: (p.categories ?? []).map((c: any) => c.name), date_modified: p.date_modified,
+  };
+}
+
+let wooDays = 3;
+
+async function syncWooCommerce(): Promise<Row[]> {
+  const site = need("WC_SITE_URL").replace(/\/$/, "");
+  const headers = { Authorization: "Basic " + btoa(`${need("WC_CONSUMER_KEY")}:${need("WC_CONSUMER_SECRET")}`) };
+  // Full history was backfilled on 30 Oct 2026. Hourly runs only need recent changes; ?days= overrides for a re-backfill.
+  const since = new Date(Date.now() - wooDays * 86_400_000).toISOString();
+  const rows: Row[] = [];
+  const pull = async (entity: string, extra: string, shape: (x: any) => unknown) => {
+    for (let page = 1; page <= 50; page++) {
+      const items: any[] = await getJson(`${site}/wp-json/wc/v3/${entity}?per_page=100&page=${page}${extra}`, { headers });
+      for (const item of items) rows.push({ entity, id: String(item.id), data: shape(item) });
+      if (items.length < 100) break;
+    }
+  };
+  await pull("orders", `&modified_after=${encodeURIComponent(since)}`, wooOrder);
+  await pull("products", "", wooProduct);
+  return rows;
+}
+
 const SOURCES: Record<string, () => Promise<Row[]>> = {
   current_rms: syncCurrentRms,
   brighthr: syncBrightHr,
   wordpress: syncWordPress,
+  woocommerce: syncWooCommerce,
 };
 
 async function runSource(source: string) {
@@ -173,7 +218,9 @@ Deno.serve(async (req) => {
   const [{ secret }] = await sql`select decrypted_secret as secret from vault.decrypted_secrets where name = 'sync_secret'`;
   if (!secret || req.headers.get("x-sync-secret") !== secret) return new Response("forbidden", { status: 403 });
 
-  const requested = new URL(req.url).searchParams.get("source");
+  const params = new URL(req.url).searchParams;
+  wooDays = Math.min(Number(params.get("days")) || 3, 400);
+  const requested = params.get("source");
   const sources = requested ? [requested] : Object.keys(SOURCES);
   const unknown = sources.filter((s) => !SOURCES[s]);
   if (unknown.length) return new Response(`unknown source: ${unknown.join(", ")}`, { status: 400 });
