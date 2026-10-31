@@ -7,6 +7,10 @@ const sql = postgres(Deno.env.get("SUPABASE_DB_URL")!, { prepare: false, max: 1 
 
 type Row = { entity: string; id: string; data: unknown };
 
+let partial = false; // Set when a source ran out of time; the run is logged as 'partial'.
+let resumeAt: string | null = null; // Where a partial run stopped, e.g. stock_levels:42.
+let totals: Record<string, number | null> = {}; // Source-reported totals, to check completeness.
+
 // HR rule: never store pay, addresses, contact details, or free-text notes.
 const BLOCKED_KEY = /note|reason|comment|description|medical|address|salary|pay|wage|email|phone|mobile|birth|nationali|bank|ni_?number/i;
 
@@ -46,18 +50,26 @@ async function getJson(url: string, init: RequestInit): Promise<any> {
 }
 
 // ---------- Current RMS ----------
-const RMS_ENTITIES = ["opportunities", "invoices", "members", "products", "projects", "stock_levels"];
+// Only what WA Staff does not hold: catalogue, pricing, stock. ?entities=a,b picks tables; ?page= resumes a long table.
+const RMS_DEFAULT = ["products", "product_groups", "stock_levels"];
+let rmsEntities = RMS_DEFAULT;
+let rmsStartPage = 1;
 
 async function syncCurrentRms(): Promise<Row[]> {
   const headers = { "X-SUBDOMAIN": need("CURRENT_RMS_SUBDOMAIN"), "X-AUTH-TOKEN": need("CURRENT_RMS_API_KEY") };
   const rows: Row[] = [];
-  for (const entity of RMS_ENTITIES) {
-    for (let page = 1; page <= 200; page++) {
+  const deadline = Date.now() + 110_000;
+  let start = rmsStartPage; // Only the first table resumes mid-way; later tables start at page 1.
+  for (const entity of rmsEntities) {
+    for (let page = start; page <= 500; page++) {
+      if (Date.now() > deadline) { partial = true; resumeAt = `${entity}:${page}`; return rows; }
       const body = await getJson(`https://api.current-rms.com/api/v1/${entity}?page=${page}&per_page=100`, { headers });
       const items: any[] = body[entity] ?? [];
       for (const item of items) rows.push({ entity, id: String(item.id), data: item });
+      if (page === start) totals[entity] = body.meta?.total_row_count ?? null;
       if (items.length < 100) break;
     }
+    start = 1;
   }
   return rows;
 }
@@ -93,7 +105,6 @@ async function brightQuery(token: string, path: string, filters?: object): Promi
 
 const isoDate = (d: Date) => d.toISOString().slice(0, 10);
 
-let partial = false; // Set when a source ran out of time; the run is logged as 'partial'.
 
 async function syncBrightHr(): Promise<Row[]> {
   const token = await brightToken();
@@ -193,7 +204,7 @@ const SOURCES: Record<string, () => Promise<Row[]>> = {
 
 async function runSource(source: string) {
   const [{ id }] = await sql`insert into hub.sync_runs (source) values (${source}) returning id`;
-  partial = false;
+  partial = false; resumeAt = null; totals = {};
   try {
     // Overlapping windows can return the same record twice; keep the last copy.
     const rows = [...new Map((await SOURCES[source]()).map((r) => [`${r.entity}:${r.id}`, r])).values()];
@@ -205,8 +216,8 @@ async function runSource(source: string) {
     }
     const counts: Record<string, number> = {};
     rows.forEach((r) => (counts[r.entity] = (counts[r.entity] ?? 0) + 1));
-    await sql`update hub.sync_runs set status = ${partial ? "partial" : "ok"}, finished_at = now(), row_count = ${rows.length}, detail = ${sql.json(counts)} where id = ${id}`;
-    return { source, status: partial ? "partial" : "ok", rows: rows.length, counts };
+    await sql`update hub.sync_runs set status = ${partial ? "partial" : "ok"}, finished_at = now(), row_count = ${rows.length}, detail = ${sql.json({ counts, totals, resumeAt })} where id = ${id}`;
+    return { source, status: partial ? "partial" : "ok", rows: rows.length, counts, totals, resumeAt };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await sql`update hub.sync_runs set status = 'error', finished_at = now(), detail = ${sql.json({ error: message })} where id = ${id}`;
@@ -220,6 +231,8 @@ Deno.serve(async (req) => {
 
   const params = new URL(req.url).searchParams;
   wooDays = Math.min(Number(params.get("days")) || 3, 400);
+  rmsEntities = params.get("entities")?.split(",").filter(Boolean) ?? RMS_DEFAULT;
+  rmsStartPage = Math.max(Number(params.get("page")) || 1, 1);
   const requested = params.get("source");
   const sources = requested ? [requested] : Object.keys(SOURCES);
   const unknown = sources.filter((s) => !SOURCES[s]);
